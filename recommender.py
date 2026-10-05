@@ -3,86 +3,85 @@ import joblib
 import numpy as np
 import pandas as pd
 
-_cache = {}          # remembers the loaded file, so it is not loaded again and again
-
+_cache = {}
 
 def load_bundle(path="models/recommender_bundle.joblib"):
     if path not in _cache:
         _cache[path] = joblib.load(path)
     return _cache[path]
 
-
 def find_movie(query, bundle=None):
-    """Return (row number, suggestions). Exact title match first, then partial match; most-rated movie wins."""
-    if bundle is None:
-        bundle = load_bundle()
-    movies = bundle["movies"]
-    q = str(query).lower().strip()
-    keys = movies["title_key"]
-
-    # 1. exact match
-    exact = movies[keys == q]
-    if len(exact) > 0:
-        return int(exact["n_ratings"].idxmax()), []
-
-    # 2. partial match (query is part of the title)
-    if q != "":
-        partial = movies[keys.str.contains(q, regex=False)]
-        if len(partial) > 0:
-            return int(partial["n_ratings"].idxmax()), []
-
-    # 3. not found: suggest close titles
+    """Return (row index, suggestions). Exact match first, then partial; most-rated movie wins."""
+    b = bundle or load_bundle()
+    movies = b["movies"]
+    q, keys = str(query).lower().strip(), movies["title_key"]
+    for hit in (movies[keys == q], movies[keys.str.contains(q, regex=False)] if q else movies.iloc[:0]):
+        if len(hit):
+            return int(hit["n_ratings"].idxmax()), []
     close = difflib.get_close_matches(q, keys.tolist(), n=5, cutoff=0.5)
-    suggestions = []
-    for c in close:
-        suggestions.append(movies.loc[keys == c, "title"].iloc[0])
-    return None, suggestions
-
+    return None, [movies.loc[keys == c, "title"].iloc[0] for c in close]
 
 def recommend_movies(movie_title, top_n=10, bundle=None):
-    """Top-N movies most similar to movie_title (KNN, cosine similarity)."""
-    if bundle is None:
-        bundle = load_bundle()
-    idx, suggestions = find_movie(movie_title, bundle)
+    """Top-N similar movies based on content metadata and popularity."""
+    b = bundle or load_bundle()
+    idx, suggestions = find_movie(movie_title, b)
+    movies = b["movies"]
     if idx is None:
-        message = f"Movie '{movie_title}' not found."
-        if len(suggestions) > 0:
-            message = message + " Did you mean: " + "; ".join(suggestions)
-        print(message)
+        print(f"Movie '{movie_title}' not found." + (" Did you mean: " + "; ".join(suggestions) if suggestions else ""))
         return pd.DataFrame()
-
-    dist, ind = bundle["knn_model"].kneighbors(bundle["movie_matrix"][idx], n_neighbors=int(top_n) + 1)
-    keep = ind[0] != idx                                   # remove the movie itself from its own list
-    dist = dist[0][keep][:top_n]
-    ind = ind[0][keep][:top_n]
-
-    recs = bundle["movies"].iloc[ind][["title", "genres", "release_year", "vote_average", "n_ratings"]].copy()
-    recs["similarity"] = (1 - dist).round(4)
+    
+    target_movie = movies.iloc[idx]
+    # Simple content/genre similarity ranking
+    same_genre = movies[movies.genres == target_movie.genres].copy()
+    same_genre = same_genre[same_genre.movieId != target_movie.movieId]
+    recs = same_genre.sort_values("n_ratings", ascending=False).head(top_n)
+    
+    if len(recs) < top_n:
+        more = movies[~movies.movieId.isin(set(recs.movieId) | {target_movie.movieId})].sort_values("n_ratings", ascending=False).head(top_n - len(recs))
+        recs = pd.concat([recs, more])
+        
+    recs = recs[["title", "genres", "release_year", "vote_average", "n_ratings"]].copy()
     recs.insert(0, "Rank", np.arange(1, len(recs) + 1))
     return recs.reset_index(drop=True)
-
 
 def recommend_for_user(user_id, top_n=10, bundle=None):
-    """Top-N movies for a user: neighbours of the movies the user liked (rating >= 4), already-rated movies hidden."""
-    if bundle is None:
-        bundle = load_bundle()
-    seeds = bundle["liked"].get(user_id, [])[-20:]          # last 20 liked movies
-    if len(seeds) == 0:
-        print(f"User {user_id} not found or has no liked movies.")
+    """Personalised Top-N recommendation for a user using RF Classifier & RF Regressor models."""
+    b = bundle or load_bundle()
+    movies = b["movies"]
+    all_movie_ids = movies["movieId"].values
+    seen = b["seen"].get(user_id, set())
+    
+    cand_ids = [m for m in all_movie_ids if m not in seen]
+    if not cand_ids:
         return pd.DataFrame()
-
-    dist, ind = bundle["knn_model"].kneighbors(bundle["movie_matrix"][seeds], n_neighbors=51)
-    score = {}
-    for d_row, i_row in zip(dist, ind):
-        for d, i in zip(d_row, i_row):
-            if i not in bundle["seen"][user_id]:
-                score[i] = score.get(i, 0) + 1 - d
-
-    top = sorted(score, key=score.get, reverse=True)[:int(top_n)]    # highest score first
-    recs = bundle["movies"].iloc[top][["title", "genres", "release_year", "vote_average"]].copy()
-    scores_list = []
-    for i in top:
-        scores_list.append(round(score[i], 3))
-    recs["score"] = scores_list
-    recs.insert(0, "Rank", np.arange(1, len(recs) + 1))
-    return recs.reset_index(drop=True)
+    
+    u_info = b["u_stats"].get(user_id, {"u_cnt": 0, "u_mean": b["global_rating"], "u_like": b["global_like"]})
+    movie_meta_dict = b["movie_meta_dict"]
+    
+    rows = []
+    for m in cand_ids:
+        m_info = b["m_stats"].get(m, {"m_cnt": 0, "m_mean": b["global_rating"], "m_like": b["global_like"]})
+        meta_info = movie_meta_dict[m]
+        row = {
+            "u_cnt": u_info["u_cnt"], "u_mean": u_info["u_mean"], "u_like": u_info["u_like"],
+            "m_cnt": m_info["m_cnt"], "m_mean": m_info["m_mean"], "m_like": m_info["m_like"],
+            **meta_info
+        }
+        rows.append(row)
+        
+    cand_df = pd.DataFrame(rows, columns=b["feature_cols"])
+    prob_like = b["rf_cls"].predict_proba(cand_df)[:, 1]
+    pred_rating = b["rf_reg"].predict(cand_df)
+    
+    rec_score = 0.5 * prob_like + 0.5 * (pred_rating / 5.0)
+    
+    res = pd.DataFrame({
+        "movieId": cand_ids,
+        "prob_like": prob_like.round(4),
+        "pred_rating": pred_rating.round(2),
+        "rec_score": rec_score.round(4)
+    }).sort_values("rec_score", ascending=False).head(top_n)
+    
+    res = res.merge(movies[["movieId", "title", "genres", "release_year"]], on="movieId")
+    res.insert(0, "Rank", np.arange(1, len(res) + 1))
+    return res[["Rank", "title", "genres", "release_year", "prob_like", "pred_rating", "rec_score"]]
