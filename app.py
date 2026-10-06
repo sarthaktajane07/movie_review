@@ -3,7 +3,7 @@ from recommender import load_bundle, find_movie, recommend_movies, recommend_for
 
 st.set_page_config(page_title="Personalized Movie Recommender", layout="wide")
 st.title("🎬 Personalized Movie Recommendation System")
-st.caption("Supervised ML: Random Forest Classifier (P(Like)) + Random Forest Regressor (Rating Prediction)")
+st.caption("Supervised ML: Logistic Regression Classifier (P(Like)) + Linear Regression Model (Rating Prediction)")
 
 bundle = st.cache_resource(load_bundle)()
 movies = bundle["movies"]
